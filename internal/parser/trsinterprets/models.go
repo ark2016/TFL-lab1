@@ -1,18 +1,37 @@
-package interprets
+package trsinterprets
 
 import "fmt"
 
 type Interpretation struct {
-	name      string
-	args      []string
-	monomials []Monomial
-	constants []int
+	Name      string
+	Args      []string
+	Monomials []Monomial
 }
 
+// NOTE: one of {constant, factors}
 type Monomial struct {
-	variable    string
-	coefficient int
-	power       int
+	Constant *int
+	Factors  *[]Factor
+}
+
+func NewConstantMonomial(v int) Monomial {
+	return Monomial{
+		Constant: &v,
+		Factors:  nil,
+	}
+}
+
+func NewProductMonomial(factors []Factor) Monomial {
+	return Monomial{
+		Constant: nil,
+		Factors:  &factors,
+	}
+}
+
+type Factor struct {
+	Variable    string
+	Coefficient int
+	Power       int
 }
 
 type ParseError struct {
