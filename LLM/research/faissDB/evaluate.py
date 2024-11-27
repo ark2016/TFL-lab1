@@ -1,9 +1,14 @@
 from load_data import load_dataset, load_db
 from metrics import generalized_top_k_accuracy, generalized_jaccard_index
+from faiss_for_experiment import initialize_model, create_embeddings, create_faiss_index, search_similar
 
-def evaluate_algorithm(dataset_path, db_path, algorithm, k, s):
+def evaluate_algorithm(dataset_path, db_path, k, s):
     dataset = load_dataset(dataset_path)
     db = load_db(db_path)
+
+    model = initialize_model()
+    embeddings = create_embeddings(model, list(db.values()))
+    index = create_faiss_index(embeddings)
 
     top_k_accuracy_sum = 0
     jaccard_index_sum = 0
@@ -13,7 +18,7 @@ def evaluate_algorithm(dataset_path, db_path, algorithm, k, s):
         expected = item['expected']
 
         # Получаем предсказание от алгоритма
-        predicted_answers = algorithm(question, db)
+        predicted_answers = search_similar(model, index, question, list(db.values()), k_max=k)
         predicted_numbers = [db[answer['number']]['number'] for answer in predicted_answers]
 
         # Вычисляем метрики
