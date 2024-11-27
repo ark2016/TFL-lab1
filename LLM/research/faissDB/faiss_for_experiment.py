@@ -23,7 +23,8 @@ def initialize_model():
 
 
 def create_embeddings(model, data):
-    texts = [translator.translate_text(item["question"] + " " + item["answer"]) for item in data]
+    texts = [translator.translate_text(item["question"]) for item in data]
+    # texts = [item["question"] + " " + item["answer"] for item in data]
     embeddings = model.encode(texts)
     # Нормализуем векторы
     faiss.normalize_L2(embeddings)
@@ -52,6 +53,7 @@ def search_similar(model, index, query, data, k_max=10, similarity_threshold=0.1
     """
     # get the query vector
     query_embedding = model.encode([translator.translate_text(query)])
+    # query_embedding = model.encode([query)])
     # Нормализуем вектор запроса
     faiss.normalize_L2(query_embedding)
 
