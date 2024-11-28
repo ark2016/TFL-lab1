@@ -4,6 +4,7 @@ import numpy as np
 import pickle
 import os
 from deep_translator import GoogleTranslator
+from extract_key_words_nltk import extract_keywords
 
 
 class TextTranslator:
@@ -23,7 +24,9 @@ def initialize_model():
 
 
 def create_embeddings(model, data):
-    texts = [translator.translate_text(item["question"]) for item in data]
+    texts = [translator.translate_text(item["question"] + " " + item["answer"] + " "
+                                       + ' '.join(extract_keywords(item["answer"], top_n=5))) for item in data]
+    # texts = [translator.translate_text(item["question"]) for item in data]
     # texts = [item["question"] + " " + item["answer"] for item in data]
     embeddings = model.encode(texts)
     # Нормализуем векторы
@@ -69,6 +72,9 @@ def search_similar(model, index, query, data, k_max=10, similarity_threshold=0.1
         if D[0][i] - closest_distance > similarity_threshold:
             break
         dynamic_k += 1
+
+    # for (idx, k) in zip(I[0][:dynamic_k], D[0][:dynamic_k]):
+    #     print(f"Distance: {k}, Question: {data[idx]['question']}")
 
     # Return only those objects that satisfy the dynamic k
     return [data[idx] for idx in I[0][:dynamic_k]]
