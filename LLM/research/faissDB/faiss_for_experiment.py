@@ -39,7 +39,7 @@ def create_faiss_index(embeddings):
     return index
 
 
-def search_similar(model, index, query, data, k_max=2, similarity_threshold=0.7):
+def search_similar(model, index, query, data, k_max=2, similarity_threshold=0.69):
     """
     Dynamic search for similar objects based on similarity threshold.
     :param model: sentence transformer model
@@ -61,7 +61,6 @@ def search_similar(model, index, query, data, k_max=2, similarity_threshold=0.7)
     # Dynamically determine k depending on the distances
     dynamic_k = 1  # At least one result is always returned
     for i in range(1, k_max):
-        # if D[0][i] - closest_distance > similarity_threshold:
         if D[0][i] < similarity_threshold:
             break
         dynamic_k += 1
