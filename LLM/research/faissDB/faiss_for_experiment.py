@@ -4,7 +4,6 @@ import numpy as np
 import pickle
 import os
 from deep_translator import GoogleTranslator
-from extract_key_words_nltk import extract_keywords
 
 
 class TextTranslator:
@@ -24,10 +23,7 @@ def initialize_model():
 
 
 def create_embeddings(model, data):
-    texts = [translator.translate_text(item["question"] + " " + item["answer"] + " "
-                                       + ' '.join(extract_keywords(item["answer"], top_n=5))) for item in data]
-    # texts = [translator.translate_text(item["question"]) for item in data]
-    # texts = [item["question"] + " " + item["answer"] for item in data]
+    texts = [translator.translate_text(item["question"] + " " + item["answer"]) for item in data]
     embeddings = model.encode(texts)
     # Нормализуем векторы
     faiss.normalize_L2(embeddings)
@@ -43,7 +39,7 @@ def create_faiss_index(embeddings):
     return index
 
 
-def search_similar(model, index, query, data, k_max=10, similarity_threshold=0.1):
+def search_similar(model, index, query, data, k_max=2, similarity_threshold=0.7):
     """
     Dynamic search for similar objects based on similarity threshold.
     :param model: sentence transformer model
@@ -56,23 +52,21 @@ def search_similar(model, index, query, data, k_max=10, similarity_threshold=0.1
     """
     # get the query vector
     query_embedding = model.encode([translator.translate_text(query)])
-    # query_embedding = model.encode([query)])
     # Нормализуем вектор запроса
     faiss.normalize_L2(query_embedding)
 
     # perform a search with the maximum value of k
     D, I = index.search(np.array(query_embedding), k_max)
 
-    # Find the closest distance
-    closest_distance = D[0][0]
-
     # Dynamically determine k depending on the distances
     dynamic_k = 1  # At least one result is always returned
     for i in range(1, k_max):
-        if D[0][i] - closest_distance > similarity_threshold:
+        # if D[0][i] - closest_distance > similarity_threshold:
+        if D[0][i] < similarity_threshold:
             break
         dynamic_k += 1
 
+    # For debugging
     # for (idx, k) in zip(I[0][:dynamic_k], D[0][:dynamic_k]):
     #     print(f"Distance: {k}, Question: {data[idx]['question']}")
 
