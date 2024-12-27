@@ -1,46 +1,59 @@
-import os
 import torch
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 import faiss
 import numpy as np
-import pickle
 
 
 def initialize_model():
-    # Загрузка конфигурации с обработкой отсутствующего атрибута
-    config = AutoConfig.from_pretrained('ai-sage/Giga-Embeddings-instruct', trust_remote_code=True)
+    try:
+        # Загрузка конфигурации с обработкой отсутствующего атрибута
+        config = AutoConfig.from_pretrained('ai-sage/Giga-Embeddings-instruct', trust_remote_code=True)
 
-    if not hasattr(config.latent_attention_config, '_attn_implementation_internal'):
-        config.latent_attention_config._attn_implementation_internal = None
+        if not hasattr(config.latent_attention_config, '_attn_implementation_internal'):
+            config.latent_attention_config._attn_implementation_internal = None
 
-    # Загрузка модели с исправленной конфигурацией
-    model = AutoModel.from_pretrained('ai-sage/Giga-Embeddings-instruct', config=config, trust_remote_code=True)
+        # Загрузка модели с исправленной конфигурацией
+        model = AutoModel.from_pretrained('ai-sage/Giga-Embeddings-instruct', config=config, trust_remote_code=True)
 
-    # Загрузка токенизатора, если требуется
-    tokenizer = AutoTokenizer.from_pretrained('ai-sage/Giga-Embeddings-instruct', trust_remote_code=True)
+        # Загрузка токенизатора
+        tokenizer = AutoTokenizer.from_pretrained('ai-sage/Giga-Embeddings-instruct', trust_remote_code=True)
 
-    return model, tokenizer
+        # Перенос модели на GPU, если доступно
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+
+        return model, tokenizer, device
+    except Exception as e:
+        print(f"Ошибка при инициализации модели или токенизатора: {e}")
+        raise
 
 
-def create_embeddings(model, tokenizer, data):
-    # Предполагается, что каждый элемент в data имеет ключи "question" и "answer"
-    task_name_to_instruct = {
-        "example": "Given a question, retrieve passages that answer the question",
-    }
+def create_embeddings(model, tokenizer, data, device):
+    """
+    Создаёт эмбеддинги для объединённых вопросов и ответов.
 
-    query_prefix = task_name_to_instruct["example"] + "\nquestion: "
-    passage_prefix = ""  # Нет инструкции для пассажа
+    Args:
+        model: Загруженная модель.
+        tokenizer: Загруженный токенизатор.
+        data: Список словарей с ключами "question" и "answer".
+        device: Устройство для вычислений.
 
-    queries = [item["question"] for item in data]
-    passages = [item["answer"] for item in data]
+    Returns:
+        NumPy массив эмбеддингов.
+    """
+    # Объединение вопроса и ответа в одну строку
+    combined_texts = [f"Question: {item['question']} Answer: {item['answer']}" for item in data]
+
+    # Инструкция, если требуется моделью
+    instruction = "Generate embeddings for the following Q&A pairs."
 
     # Получение эмбеддингов
-    query_embeddings = model.encode(queries, instruction=query_prefix)
-    passage_embeddings = model.encode(passages, instruction=passage_prefix)
-
-    # Объединение эмбеддингов вопросов и ответов
-    embeddings = np.concatenate((query_embeddings, passage_embeddings), axis=0)
+    inputs = tokenizer(combined_texts, padding=True, truncation=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        # Предполагается, что эмбеддинг берётся из последнего скрытого состояния
+        embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
 
     # Нормализация эмбеддингов
     embeddings = F.normalize(torch.tensor(embeddings), p=2, dim=1).numpy()
@@ -48,98 +61,65 @@ def create_embeddings(model, tokenizer, data):
     return embeddings
 
 
-def create_faiss_index(embeddings):
+def create_faiss_index(embeddings, data_length):
+    """
+    Создаёт FAISS индекс для заданных эмбеддингов.
+
+    Args:
+        embeddings: NumPy массив эмбеддингов.
+        data_length: Количество элементов в данных.
+
+    Returns:
+        FAISS индекс.
+    """
     dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)
-    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(dimension)  # Используем Inner Product (cosine similarity после нормализации)
+    faiss.normalize_L2(embeddings)  # Нормализуем эмбеддинги
     index.add(embeddings)
+    print(f"FAISS index содержит {index.ntotal} эмбеддингов.")
+    print(f"Список данных содержит {data_length} элементов.")
     return index
 
 
-def search_similar(model, tokenizer, index, query, data, task_instruct, k_max=2, similarity_threshold=0.69):
-    query_prefix = task_instruct + "\nquestion: "
-    query_instruct = query_prefix + query
-    query_embedding = model.encode([query], instruction=query_prefix)
+def search_similar(model, tokenizer, index, query, data, device, k_max=2, similarity_threshold=0.69):
+    """
+    Ищет похожие элементы в FAISS индексе для заданного запроса.
 
-    # Нормализация эмбеддингов
+    Args:
+        model: Загруженная модель.
+        tokenizer: Загруженный токенизатор.
+        index: FAISS индекс.
+        query: Вопрос для поиска.
+        data: Список словарей с ключами "question" и "answer".
+        device: Устройство для вычислений.
+        k_max: Максимальное количество результатов для поиска.
+        similarity_threshold: Порог схожести для фильтрации результатов.
+
+    Returns:
+        Список похожих элементов.
+    """
+    # Объединение запроса с инструкцией
+    combined_query = f"Question: {query} Answer:"
+
+    # Получение эмбеддинга для запроса
+    inputs = tokenizer([combined_query], padding=True, truncation=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        query_embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+
+    # Нормализация эмбеддинга
     query_embedding = F.normalize(torch.tensor(query_embedding), p=2, dim=1).numpy()
 
     # Поиск в FAISS
     D, I = index.search(query_embedding, k_max)
-
-    dynamic_k = 1
-    for i in range(1, k_max):
-        if D[0][i] < similarity_threshold:
-            break
-        dynamic_k += 1
+    print(f"Результаты поиска для запроса '{query}': Индексы={I}, Расстояния={D}")
 
     similar_items = []
-    for idx, distance in zip(I[0][:dynamic_k], D[0][:dynamic_k]):
-        similar_items.append({"distance": distance, "item": data[idx]})
-        print(f"Distance: {distance}, Question: {data[idx]['question']}")
+    for idx, distance in zip(I[0], D[0]):
+        if distance >= similarity_threshold and idx < len(data):
+            similar_items.append({"distance": distance, "item": data[idx]})
+            print(f"Distance: {distance}, Question: {data[idx]['question']}")
+        else:
+            print(f"Warning: idx {idx} is out of range или distance {distance} ниже порога.")
 
     return [item["item"] for item in similar_items]
-
-
-def save_vectorized_data(data, embeddings, index, filename):
-    with open(f"{filename}_data.pkl", "wb") as f:
-        pickle.dump(data, f)
-    np.save(f"{filename}_embeddings.npy", embeddings)
-    faiss.write_index(index, f"{filename}_index.faiss")
-
-
-def load_vectorized_data(filename):
-    with open(f"{filename}_data.pkl", "rb") as f:
-        data = pickle.load(f)
-    embeddings = np.load(f"{filename}_embeddings.npy")
-    index = faiss.read_index(f"{filename}_index.faiss")
-    return data, embeddings, index
-
-
-def process_questions(questions_list, use_saved=False, filename="vectorized_data"):
-    model, tokenizer = initialize_model()
-
-    if use_saved and os.path.exists(f"{filename}_data.pkl"):
-        data, embeddings, index = load_vectorized_data(filename)
-    else:
-        data = questions_list
-        embeddings = create_embeddings(model, tokenizer, data)
-        index = create_faiss_index(embeddings)
-        save_vectorized_data(data, embeddings, index, filename)
-
-    # Определение инструкции для поиска
-    task_name_to_instruct = {
-        "example": "Given a question, retrieve passages that answer the question",
-    }
-    task_instruct = task_name_to_instruct["example"]
-
-    results = []
-    for item in questions_list:
-        query = item["question"]
-        similar_objects = search_similar(model, tokenizer, index, query, data, task_instruct)
-        result_str = f"Запрос: {query}\nПохожие объекты:\n"
-        for obj in similar_objects:
-            result_str += f"Вопрос: {obj['question']}, Ответ: {obj['answer']}\n"
-        results.append(result_str)
-
-    return results
-
-
-def add_new_questions(new_questions, filename="vectorized_data"):
-    model, tokenizer = initialize_model()
-
-    if os.path.exists(f"{filename}_data.pkl"):
-        data, embeddings, index = load_vectorized_data(filename)
-    else:
-        raise FileNotFoundError(f"No existing data found at {filename}. Please initialize the database first.")
-
-    new_embeddings = create_embeddings(model, tokenizer, new_questions)
-
-    updated_data = data + new_questions
-    updated_embeddings = np.vstack((embeddings, new_embeddings))
-
-    index.add(new_embeddings)
-
-    save_vectorized_data(updated_data, updated_embeddings, index, filename)
-
-    print(f"Added {len(new_questions)} new questions to the database.")
