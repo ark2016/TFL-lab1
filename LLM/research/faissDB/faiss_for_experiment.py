@@ -1,125 +1,131 @@
-import torch
-import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+# faiss_for_experiment.py
+
+from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
+import yaml
+from nltk import download
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+import string
 
+# Загрузка ресурсов NLTK
+download('stopwords', quiet=True)
+download('punkt', quiet=True)
+stop_words = set(stopwords.words('russian'))
 
-def initialize_model():
-    try:
-        # Загрузка конфигурации с обработкой отсутствующего атрибута
-        config = AutoConfig.from_pretrained('ai-sage/Giga-Embeddings-instruct', trust_remote_code=True)
-
-        if not hasattr(config.latent_attention_config, '_attn_implementation_internal'):
-            config.latent_attention_config._attn_implementation_internal = None
-
-        # Загрузка модели с исправленной конфигурацией
-        model = AutoModel.from_pretrained('ai-sage/Giga-Embeddings-instruct', config=config, trust_remote_code=True)
-
-        # Загрузка токенизатора
-        tokenizer = AutoTokenizer.from_pretrained('ai-sage/Giga-Embeddings-instruct', trust_remote_code=True)
-
-        # Перенос модели на GPU, если доступно
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-
-        return model, tokenizer, device
-    except Exception as e:
-        print(f"Ошибка при инициализации модели или токенизатора: {e}")
-        raise
-
-
-def create_embeddings(model, tokenizer, data, device):
+def preprocess_text(text: str) -> str:
     """
-    Создаёт эмбеддинги для объединённых вопросов и ответов.
+    Предобрабатывает текст: удаляет пунктуацию, приводит к нижнему регистру,
+    удаляет стоп-слова и токенизирует текст.
 
-    Args:
-        model: Загруженная модель.
-        tokenizer: Загруженный токенизатор.
-        data: Список словарей с ключами "question" и "answer".
-        device: Устройство для вычислений.
-
-    Returns:
-        NumPy массив эмбеддингов.
+    :param text: Исходный текст.
+    :return: Предобработанный текст.
     """
-    # Объединение вопроса и ответа в одну строку
-    combined_texts = [f"Question: {item['question']} Answer: {item['answer']}" for item in data]
+    translator = str.maketrans('', '', string.punctuation)
+    text = text.strip().translate(translator).lower()
+    words = word_tokenize(text)
+    filtered_words = [word for word in words if word not in stop_words]
+    return ' '.join(filtered_words)
 
-    # Инструкция, если требуется моделью
-    instruction = "Generate embeddings for the following Q&A pairs."
+def convex_indexes(q_idx: int, counts: list[int]) -> (int, int):
+    """
+    Преобразует индекс FAISS в позиции элемента базы знаний и вопроса внутри элемента.
 
-    # Получение эмбеддингов
-    inputs = tokenizer(combined_texts, padding=True, truncation=True, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-        # Предполагается, что эмбеддинг берётся из последнего скрытого состояния
-        embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+    :param q_idx: Индекс FAISS.
+    :param counts: Список количества вопросов в каждом элементе базы знаний.
+    :return: Кортеж (индекс элемента базы знаний, индекс вопроса внутри элемента).
+    """
+    elem_index = 0
 
-    # Нормализация эмбеддингов
-    embeddings = F.normalize(torch.tensor(embeddings), p=2, dim=1).numpy()
+    for item in counts:
+        if q_idx < item:
+            # Возвращаем элемент базы знаний, содержащий вопрос с номером q_idx
+            # и номер вопроса внутри этого элемента
+            return elem_index, q_idx
 
+        q_idx -= item
+        elem_index += 1
+
+    raise ValueError("q_idx is out of bounds")
+
+def initialize_model() -> SentenceTransformer:
+    """
+    Инициализирует и возвращает модель SentenceTransformer.
+
+    :return: Объект модели SentenceTransformer.
+    """
+    transformer_name = "Snowflake/snowflake-arctic-embed-l-v2.0"
+    model = SentenceTransformer(transformer_name)
+    return model
+
+def create_embeddings(model: SentenceTransformer, data: list[dict]) -> np.ndarray:
+    """
+    Создает и нормализует эмбеддинги для данных.
+
+    :param model: Объект модели SentenceTransformer.
+    :param data: Данные для создания эмбеддингов. Ожидается список словарей с ключами "question" и "answer".
+    :return: Нормализованные эмбеддинги.
+    """
+    texts = [preprocess_text(item["question"] + " " + item["answer"]) for item in data]
+    embeddings = model.encode(texts, convert_to_numpy=True)
+    faiss.normalize_L2(embeddings)
     return embeddings
 
-
-def create_faiss_index(embeddings, data_length):
+def create_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
     """
-    Создаёт FAISS индекс для заданных эмбеддингов.
+    Создает индекс FAISS для заданных эмбеддингов.
 
-    Args:
-        embeddings: NumPy массив эмбеддингов.
-        data_length: Количество элементов в данных.
-
-    Returns:
-        FAISS индекс.
+    :param embeddings: Эмбеддинги для индексации.
+    :return: Объект индекса FAISS.
     """
+    if embeddings.size == 0:
+        raise ValueError("Эмбеддинги пусты. Невозможно создать индекс FAISS.")
+
     dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)  # Используем Inner Product (cosine similarity после нормализации)
-    faiss.normalize_L2(embeddings)  # Нормализуем эмбеддинги
+    index = faiss.IndexFlatIP(dimension)
     index.add(embeddings)
-    print(f"FAISS index содержит {index.ntotal} эмбеддингов.")
-    print(f"Список данных содержит {data_length} элементов.")
     return index
 
-
-def search_similar(model, tokenizer, index, query, data, device, k_max=2, similarity_threshold=0.69):
+def search_similar(model: SentenceTransformer, index: faiss.IndexFlatIP, question: str, db_values: list[dict],
+                  k_max: int, similarity_threshold: float) -> list[int]:
     """
-    Ищет похожие элементы в FAISS индексе для заданного запроса.
+    Ищет похожие ответы на заданный вопрос.
 
-    Args:
-        model: Загруженная модель.
-        tokenizer: Загруженный токенизатор.
-        index: FAISS индекс.
-        query: Вопрос для поиска.
-        data: Список словарей с ключами "question" и "answer".
-        device: Устройство для вычислений.
-        k_max: Максимальное количество результатов для поиска.
-        similarity_threshold: Порог схожести для фильтрации результатов.
-
-    Returns:
-        Список похожих элементов.
+    :param model: Объект модели SentenceTransformer.
+    :param index: Индекс FAISS.
+    :param question: Входной вопрос.
+    :param db_values: База данных для поиска. Ожидается список словарей с ключами "number", "question" и "answer".
+    :param k_max: Максимальное количество результатов.
+    :param similarity_threshold: Порог схожести.
+    :return: Список номеров предсказанных ответов.
     """
-    # Объединение запроса с инструкцией
-    combined_query = f"Question: {query} Answer:"
-
-    # Получение эмбеддинга для запроса
-    inputs = tokenizer([combined_query], padding=True, truncation=True, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**inputs)
-        query_embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
-
-    # Нормализация эмбеддинга
-    query_embedding = F.normalize(torch.tensor(query_embedding), p=2, dim=1).numpy()
+    # Предобработка и кодирование вопроса
+    preprocessed_question = preprocess_text(question)
+    query_embedding = model.encode([preprocessed_question], convert_to_numpy=True)
+    faiss.normalize_L2(query_embedding)
 
     # Поиск в FAISS
-    D, I = index.search(query_embedding, k_max)
-    print(f"Результаты поиска для запроса '{query}': Индексы={I}, Расстояния={D}")
+    distances, indices = index.search(np.array(query_embedding), k_max)
 
-    similar_items = []
-    for idx, distance in zip(I[0], D[0]):
-        if distance >= similarity_threshold and idx < len(data):
-            similar_items.append({"distance": distance, "item": data[idx]})
-            print(f"Distance: {distance}, Question: {data[idx]['question']}")
-        else:
-            print(f"Warning: idx {idx} is out of range или distance {distance} ниже порога.")
+    # Получение количества вопросов в каждом элементе базы знаний
+    elem_index_questions = [1 for item in db_values]
 
-    return [item["item"] for item in similar_items]
+    predicted_numbers = []
+    kb_items_idxes_set = set()
+
+    for i in range(k_max):
+        if distances[0][i] < similarity_threshold:
+            break
+
+        try:
+            ans_pos, question_pos = convex_indexes(indices[0][i], elem_index_questions)
+        except ValueError:
+            continue  # Пропустить, если индекс выходит за пределы
+
+        # Проверяем, был ли уже добавлен этот ответ
+        if ans_pos not in kb_items_idxes_set:
+            kb_items_idxes_set.add(ans_pos)
+            predicted_numbers.append(db_values[ans_pos]["number"])
+
+    return predicted_numbers
